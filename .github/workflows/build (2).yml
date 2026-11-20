@@ -1,0 +1,1202 @@
+name: Build Android APK
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate project (all source files are inside this workflow)
+        run: |
+          set -e
+          P=generated_project
+          mkdir -p "$P" && cd "$P"
+          mkdir -p "$(dirname "settings.gradle")"
+          cat > "settings.gradle" << 'EOF_FILE'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = 'MahmuodUI'
+          include ':app'
+          include ':xposed-stub'
+          EOF_FILE
+          mkdir -p "$(dirname "build.gradle")"
+          cat > "build.gradle" << 'EOF_FILE'
+          plugins {
+              id 'com.android.application' version '8.7.3' apply false
+          }
+          EOF_FILE
+          mkdir -p "$(dirname "gradle.properties")"
+          cat > "gradle.properties" << 'EOF_FILE'
+          org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
+          android.useAndroidX=false
+          EOF_FILE
+          mkdir -p "$(dirname "app/build.gradle")"
+          cat > "app/build.gradle" << 'EOF_FILE'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'dev.mahmuod.ui'
+              compileSdk 35
+
+              defaultConfig {
+                  applicationId 'dev.mahmuod.ui'
+                  minSdk 26
+                  targetSdk 35
+                  versionCode 7
+                  versionName '0.6.0'
+              }
+          }
+
+          dependencies {
+              compileOnly project(':xposed-stub')
+          }
+          EOF_FILE
+          mkdir -p "$(dirname "app/src/main/AndroidManifest.xml")"
+          cat > "app/src/main/AndroidManifest.xml" << 'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:allowBackup="false"
+                  android:icon="@drawable/mahmoud_ui_icon"
+                  android:label="Mahmoud UI"
+                  android:supportsRtl="true"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <meta-data android:name="xposedmodule" android:value="true" />
+                  <meta-data android:name="xposeddescription" android:value="منزلق موحد لقوة تمويه مركز التحكم الأصلي" />
+                  <meta-data android:name="xposedminversion" android:value="82" />
+                  <meta-data android:name="xposedscope" android:resource="@array/xposed_scope" />
+              </application>
+          </manifest>
+          EOF_FILE
+          mkdir -p "$(dirname "app/src/main/res/values/arrays.xml")"
+          cat > "app/src/main/res/values/arrays.xml" << 'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string-array name="xposed_scope">
+                  <item>com.android.systemui</item>
+              </string-array>
+          </resources>
+          EOF_FILE
+          mkdir -p "$(dirname "app/src/main/assets/xposed_init")"
+          cat > "app/src/main/assets/xposed_init" << 'EOF_FILE'
+          dev.mahmuod.ui.BlurRestoreHook
+          EOF_FILE
+          mkdir -p "$(dirname "app/src/main/java/dev/mahmuod/ui/BlurRestoreHook.java")"
+          cat > "app/src/main/java/dev/mahmuod/ui/BlurRestoreHook.java" << 'EOF_FILE'
+          package dev.mahmuod.ui;
+
+          import android.app.Application;
+          import android.provider.Settings;
+          import android.os.SystemClock;
+
+          import de.robv.android.xposed.IXposedHookLoadPackage;
+          import de.robv.android.xposed.XC_MethodHook;
+          import de.robv.android.xposed.XposedBridge;
+          import de.robv.android.xposed.XposedHelpers;
+          import de.robv.android.xposed.callbacks.XC_LoadPackage;
+
+          /** Fixed, narrow adjustment: soften only Samsung Quick Settings blur radius. */
+          public final class BlurRestoreHook implements IXposedHookLoadPackage {
+              private static final String TAG = "MahmuodUI-BlurRestore";
+              // Lower radius means less dense blur; do not alter tint, alpha, dim, or layout.
+              private static final String SETTING_KEY = "mahmuod_ui_blur_strength_v2";
+              private static final int DEFAULT_STRENGTH = 20;
+              private static volatile int cachedStrength = DEFAULT_STRENGTH;
+              private static volatile long lastReadAt;
+
+              @Override
+              public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
+                  if (!"com.android.systemui".equals(lpparam.packageName)) return;
+                  try {
+                      Class<?> curve = XposedHelpers.findClass(
+                              "com.android.systemui.blur.QSColorCurve", lpparam.classLoader);
+                      XposedHelpers.findAndHookMethod(curve, "setFraction", float.class,
+                              new XC_MethodHook() {
+                                  @Override
+                                  protected void afterHookedMethod(MethodHookParam param) {
+                                      try {
+                                          int strength = readStrength();
+                                          float radius = XposedHelpers.getFloatField(param.thisObject, "radius");
+                                          if (Float.isNaN(radius) || Float.isInfinite(radius) || radius <= 0f) return;
+                                          XposedHelpers.setFloatField(param.thisObject, "radius", radius * (strength / 100f));
+                                      } catch (Throwable error) {
+                                          XposedBridge.log(TAG + ": could not adjust blur radius: " + error);
+                                      }
+                                  }
+                              });
+                      XposedBridge.log(TAG + ": adjustable stock QS blur radius hook installed");
+                  } catch (Throwable error) {
+                      // Fail closed: if this SystemUI build differs, leave the stock UI untouched.
+                      XposedBridge.log(TAG + ": hook unavailable; stock SystemUI left unchanged: " + error);
+                  }
+              }
+
+              private static int readStrength() {
+                  long now = SystemClock.uptimeMillis();
+                  if (now - lastReadAt < 250L) return cachedStrength;
+                  synchronized (BlurRestoreHook.class) {
+                      if (now - lastReadAt >= 250L) {
+                          try {
+                              Application app = (Application) XposedHelpers.callStaticMethod(
+                                      XposedHelpers.findClass("android.app.ActivityThread", null),
+                                      "currentApplication");
+                              if (app != null) {
+                                  cachedStrength = Settings.System.getInt(app.getContentResolver(),
+                                          SETTING_KEY, DEFAULT_STRENGTH);
+                                  cachedStrength = Math.max(1, Math.min(100, cachedStrength));
+                              }
+                          } catch (Throwable error) {
+                              XposedBridge.log(TAG + ": cannot read strength; keeping cached value: " + error);
+                          }
+                          lastReadAt = now;
+                      }
+                  }
+                  return cachedStrength;
+              }
+          }
+          EOF_FILE
+          mkdir -p "$(dirname "app/src/main/java/dev/mahmuod/ui/MainActivity.java")"
+          cat > "app/src/main/java/dev/mahmuod/ui/MainActivity.java" << 'EOF_FILE'
+          package dev.mahmuod.ui;
+
+          import android.app.Activity;
+          import android.content.res.ColorStateList;
+          import android.content.res.Configuration;
+          import android.graphics.Color;
+          import android.graphics.Typeface;
+          import android.graphics.drawable.ClipDrawable;
+          import android.graphics.drawable.ColorDrawable;
+          import android.graphics.drawable.Drawable;
+          import android.graphics.drawable.GradientDrawable;
+          import android.graphics.drawable.LayerDrawable;
+          import android.graphics.drawable.RippleDrawable;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.provider.Settings;
+          import android.text.SpannableString;
+          import android.text.Spanned;
+          import android.text.style.RelativeSizeSpan;
+          import android.view.Gravity;
+          import android.view.HapticFeedbackConstants;
+          import android.view.MotionEvent;
+          import android.view.View;
+          import android.view.Window;
+          import android.view.WindowInsets;
+          import android.view.WindowInsetsController;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.SeekBar;
+          import android.widget.TextView;
+          import android.widget.Toast;
+          import java.util.concurrent.ExecutorService;
+          import java.util.concurrent.Executors;
+
+          /**
+           * Mahmoud UI settings screen, styled after Samsung One UI 9:
+           * large title header, rounded grouped cards, a thick pill slider with a white handle,
+           * a big counter with round +/- steppers, and pill presets. Follows the system dark/light mode.
+           */
+          public final class MainActivity extends Activity {
+              private static final String KEY = "mahmuod_ui_blur_strength_v2";
+              private static final int DEFAULT_STRENGTH = 20;
+              private static final int SYSTEM_STRENGTH = 100;
+              private static final int MAX_STRENGTH = 100;
+
+              private static final int STATUS_IDLE = 0;
+              private static final int STATUS_BUSY = 1;
+              private static final int STATUS_OK = 2;
+              private static final int STATUS_ERROR = 3;
+
+              private TextView valueLabel;
+              private TextView statusText;
+              private View statusDot;
+              private SeekBar strengthBar;
+              private final TextView[] chips = new TextView[3];
+              private final boolean[] chipSelected = new boolean[3];
+              private final int[] chipValues = {20, 50, MAX_STRENGTH};
+
+              private final Handler handler = new Handler(Looper.getMainLooper());
+              private final ExecutorService saver = Executors.newSingleThreadExecutor();
+              private int pendingValue = DEFAULT_STRENGTH;
+              private final Runnable persistRunnable = () -> persist(pendingValue);
+
+              // One UI palette (filled by initPalette)
+              private boolean dark;
+              private int bg, card, textPrimary, textSecondary, accent, accentSoft, track, chipBg, divider;
+              private int green, red;
+
+              @Override
+              protected void onCreate(Bundle state) {
+                  super.onCreate(state);
+                  initPalette();
+                  setupWindow();
+                  buildUi();
+                  applySystemBarAppearance();
+              }
+
+              @Override
+              protected void onResume() {
+                  super.onResume();
+                  refreshValue();
+              }
+
+              @Override
+              protected void onDestroy() {
+                  handler.removeCallbacksAndMessages(null);
+                  super.onDestroy();
+              }
+
+              // ------------------------------------------------------------------ theme
+
+              private void initPalette() {
+                  int mode = getResources().getConfiguration().uiMode & Configuration.UI_MODE_NIGHT_MASK;
+                  dark = mode == Configuration.UI_MODE_NIGHT_YES;
+                  accent = 0xFF3E91FF;
+                  if (dark) {
+                      bg = 0xFF000000;
+                      card = 0xFF1F1F1F;
+                      textPrimary = 0xFFFFFFFF;
+                      textSecondary = 0xFFA8A8A8;
+                      accentSoft = 0xFF1B3556;
+                      track = 0xFF3A3A3A;
+                      chipBg = 0xFF2E2E2E;
+                      divider = 0xFF303030;
+                      green = 0xFF30D158;
+                      red = 0xFFFF453A;
+                  } else {
+                      bg = 0xFFF6F6F6;
+                      card = 0xFFFFFFFF;
+                      textPrimary = 0xFF111111;
+                      textSecondary = 0xFF707070;
+                      accentSoft = 0xFFDDEBFF;
+                      track = 0xFFE3E3E3;
+                      chipBg = 0xFFF0F0F0;
+                      divider = 0xFFEDEDED;
+                      green = 0xFF2DB84D;
+                      red = 0xFFE5322D;
+                  }
+              }
+
+              @SuppressWarnings("deprecation")
+              private void setupWindow() {
+                  Window w = getWindow();
+                  w.setBackgroundDrawable(new ColorDrawable(bg));
+                  if (Build.VERSION.SDK_INT >= 30) {
+                      w.setDecorFitsSystemWindows(false);
+                  } else {
+                      int flags = View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                              | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                              | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION;
+                      if (!dark) {
+                          flags |= View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR;
+                          if (Build.VERSION.SDK_INT >= 26) flags |= View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR;
+                      }
+                      w.getDecorView().setSystemUiVisibility(flags);
+                  }
+                  w.setStatusBarColor(Color.TRANSPARENT);
+                  w.setNavigationBarColor(Color.TRANSPARENT);
+                  if (Build.VERSION.SDK_INT >= 29) w.setNavigationBarContrastEnforced(false);
+              }
+
+              private void applySystemBarAppearance() {
+                  if (Build.VERSION.SDK_INT < 30) return;
+                  WindowInsetsController controller = getWindow().getInsetsController();
+                  if (controller == null) return;
+                  int mask = WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS
+                          | WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS;
+                  controller.setSystemBarsAppearance(dark ? 0 : mask, mask);
+              }
+
+              // --------------------------------------------------------------------- UI
+
+              @SuppressWarnings("deprecation")
+              private void buildUi() {
+                  ScrollView scroll = new ScrollView(this);
+                  scroll.setFillViewport(true);
+                  scroll.setVerticalScrollBarEnabled(false);
+                  scroll.setBackgroundColor(bg);
+
+                  final LinearLayout content = new LinearLayout(this);
+                  content.setOrientation(LinearLayout.VERTICAL);
+                  content.setLayoutDirection(View.LAYOUT_DIRECTION_RTL);
+                  content.setPadding(dp(20), 0, dp(20), dp(24));
+                  scroll.addView(content, new ScrollView.LayoutParams(
+                          ScrollView.LayoutParams.MATCH_PARENT, ScrollView.LayoutParams.WRAP_CONTENT));
+
+                  scroll.setOnApplyWindowInsetsListener((v, insets) -> {
+                      content.setPadding(dp(20) + insets.getSystemWindowInsetLeft(),
+                              insets.getSystemWindowInsetTop(),
+                              dp(20) + insets.getSystemWindowInsetRight(),
+                              dp(24) + insets.getSystemWindowInsetBottom());
+                      return insets;
+                  });
+
+                  // ---- large title header (One UI style: big empty area, title sits at the bottom)
+                  int screenH = getResources().getDisplayMetrics().heightPixels;
+                  int headerH = Math.max(dp(190), Math.round(screenH * 0.25f));
+                  LinearLayout header = new LinearLayout(this);
+                  header.setOrientation(LinearLayout.VERTICAL);
+                  header.setGravity(Gravity.BOTTOM);
+                  header.setPadding(dp(8), 0, dp(8), dp(22));
+                  content.addView(header, new LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT, headerH));
+
+                  TextView title = new TextView(this);
+                  title.setText("Mahmoud UI");
+                  title.setTextColor(textPrimary);
+                  title.setTextSize(34);
+                  title.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+                  title.setIncludeFontPadding(false);
+                  header.addView(title, matchWrap());
+
+                  TextView subtitle = new TextView(this);
+                  subtitle.setText("تحكم بقوة تمويه مركز التحكم الأصلي");
+                  subtitle.setTextColor(textSecondary);
+                  subtitle.setTextSize(15);
+                  subtitle.setPadding(0, dp(8), 0, 0);
+                  header.addView(subtitle, matchWrap());
+
+                  // ---- card 1: blur strength
+                  LinearLayout strengthCard = newCard();
+                  TextView label = new TextView(this);
+                  label.setText("قوة التمويه");
+                  label.setTextColor(textPrimary);
+                  label.setTextSize(17);
+                  label.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+                  strengthCard.addView(label, matchWrap());
+
+                  // slider + counter are kept LTR so the fill direction is predictable
+                  LinearLayout controls = new LinearLayout(this);
+                  controls.setOrientation(LinearLayout.VERTICAL);
+                  controls.setLayoutDirection(View.LAYOUT_DIRECTION_LTR);
+
+                  LinearLayout counterRow = new LinearLayout(this);
+                  counterRow.setOrientation(LinearLayout.HORIZONTAL);
+                  counterRow.setGravity(Gravity.CENTER_VERTICAL);
+                  counterRow.addView(stepper("\u2212", "تقليل", -1), new LinearLayout.LayoutParams(dp(48), dp(48)));
+
+                  valueLabel = new TextView(this);
+                  valueLabel.setTextColor(textPrimary);
+                  valueLabel.setTextSize(56);
+                  valueLabel.setGravity(Gravity.CENTER);
+                  valueLabel.setIncludeFontPadding(false);
+                  valueLabel.setTypeface(Typeface.create("sans-serif-light", Typeface.NORMAL));
+                  counterRow.addView(valueLabel, new LinearLayout.LayoutParams(0,
+                          LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+
+                  counterRow.addView(stepper("+", "زيادة", 1), new LinearLayout.LayoutParams(dp(48), dp(48)));
+                  LinearLayout.LayoutParams counterLp = matchWrap();
+                  counterLp.topMargin = dp(10);
+                  controls.addView(counterRow, counterLp);
+
+                  strengthBar = new SeekBar(this);
+                  strengthBar.setMax(MAX_STRENGTH);
+                  styleSeekBar(strengthBar);
+                  LinearLayout.LayoutParams barLp = new LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT, dp(48));
+                  barLp.topMargin = dp(14);
+                  controls.addView(strengthBar, barLp);
+
+                  LinearLayout ends = new LinearLayout(this);
+                  ends.setOrientation(LinearLayout.HORIZONTAL);
+                  ends.setPadding(dp(6), 0, dp(6), 0);
+                  TextView less = endpoint("أضعف", Gravity.START);
+                  TextView more = endpoint("أقوى", Gravity.END);
+                  ends.addView(less, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+                  ends.addView(more, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+                  controls.addView(ends, matchWrap());
+                  strengthCard.addView(controls, matchWrap());
+
+                  // presets
+                  LinearLayout presets = new LinearLayout(this);
+                  presets.setOrientation(LinearLayout.HORIZONTAL);
+                  String[] names = {"خفيف", "متوسط", "أقصى"};
+                  for (int i = 0; i < 3; i++) {
+                      TextView chip = new TextView(this);
+                      chip.setText(names[i] + "\n" + chipValues[i] + "٪");
+                      chip.setTextSize(13);
+                      chip.setGravity(Gravity.CENTER);
+                      chip.setClickable(true);
+                      final int target = chipValues[i];
+                      chip.setOnClickListener(v -> {
+                          setStrength(target);
+                          schedulePersist();
+                      });
+                      chips[i] = chip;
+                      LinearLayout.LayoutParams chipLp = new LinearLayout.LayoutParams(0, dp(56), 1f);
+                      chipLp.leftMargin = dp(4);
+                      chipLp.rightMargin = dp(4);
+                      presets.addView(chip, chipLp);
+                  }
+                  LinearLayout.LayoutParams presetsLp = matchWrap();
+                  presetsLp.topMargin = dp(20);
+                  strengthCard.addView(presets, presetsLp);
+                  content.addView(strengthCard, cardLp());
+
+                  // ---- card 2: status + info rows
+                  LinearLayout infoCard = newCard();
+
+                  LinearLayout statusRow = new LinearLayout(this);
+                  statusRow.setOrientation(LinearLayout.HORIZONTAL);
+                  statusRow.setGravity(Gravity.CENTER_VERTICAL);
+                  statusDot = new View(this);
+                  LinearLayout.LayoutParams dotLp = new LinearLayout.LayoutParams(dp(10), dp(10));
+                  dotLp.setMarginEnd(dp(14));
+                  statusRow.addView(statusDot, dotLp);
+                  LinearLayout statusCol = new LinearLayout(this);
+                  statusCol.setOrientation(LinearLayout.VERTICAL);
+                  statusCol.addView(rowTitle("الحفظ بصلاحية الروت"), matchWrap());
+                  statusText = rowBody("");
+                  statusCol.addView(statusText, matchWrap());
+                  statusRow.addView(statusCol, new LinearLayout.LayoutParams(0,
+                          LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+                  infoCard.addView(statusRow, matchWrap());
+
+                  View line = new View(this);
+                  line.setBackgroundColor(divider);
+                  LinearLayout.LayoutParams lineLp = new LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT, Math.max(1, dp(1)));
+                  lineLp.topMargin = dp(16);
+                  lineLp.bottomMargin = dp(16);
+                  infoCard.addView(line, lineLp);
+
+                  infoCard.addView(rowTitle("عن المستويات"), matchWrap());
+                  infoCard.addView(rowBody("التحكم من 1٪ إلى 100٪؛ كلما زادت القيمة زادت قوة البلور. القيمة نفسها للدارك واللايت."),
+                          matchWrap());
+                  content.addView(infoCard, cardLp());
+
+                  strengthBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+                      @Override
+                      public void onProgressChanged(SeekBar bar, int progress, boolean fromUser) {
+                          int value = clamp(progress);
+                          if (fromUser && value != pendingValue && value % 5 == 0) {
+                              bar.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK);
+                          }
+                          pendingValue = value;
+                          updateLabel(value);
+                          // Do not spawn root prompts or writes while the thumb is moving.
+                      }
+
+                      @Override
+                      public void onStartTrackingTouch(SeekBar bar) {
+                          handler.removeCallbacks(persistRunnable);
+                      }
+
+                      @Override
+                      public void onStopTrackingTouch(SeekBar bar) {
+                          handler.removeCallbacks(persistRunnable);
+                          persist(pendingValue);
+                      }
+                  });
+
+                  setContentView(scroll);
+                  setStatus(STATUS_IDLE, "سيطلب التطبيق صلاحية الروت عند حفظ المستوى");
+                  refreshValue();
+              }
+
+              private void styleSeekBar(SeekBar bar) {
+                  int trackH = dp(14);
+
+                  GradientDrawable trackBg = round(track, trackH / 2f);
+                  GradientDrawable trackFill = round(accent, trackH / 2f);
+                  ClipDrawable clip = new ClipDrawable(trackFill, Gravity.START, ClipDrawable.HORIZONTAL);
+                  LayerDrawable layers = new LayerDrawable(new Drawable[]{trackBg, clip});
+                  layers.setId(0, android.R.id.background);
+                  layers.setId(1, android.R.id.progress);
+                  for (int i = 0; i < 2; i++) {
+                      layers.setLayerGravity(i, Gravity.CENTER_VERTICAL);
+                      layers.setLayerHeight(i, trackH);
+                  }
+                  bar.setProgressDrawable(layers);
+
+                  int thumbSize = dp(30);
+                  GradientDrawable shadow = new GradientDrawable();
+                  shadow.setShape(GradientDrawable.OVAL);
+                  shadow.setColor(dark ? 0x66000000 : 0x2A000000);
+                  shadow.setSize(thumbSize, thumbSize);
+                  GradientDrawable face = new GradientDrawable();
+                  face.setShape(GradientDrawable.OVAL);
+                  face.setColor(Color.WHITE);
+                  face.setSize(thumbSize, thumbSize);
+                  LayerDrawable thumb = new LayerDrawable(new Drawable[]{shadow, face});
+                  thumb.setLayerInset(1, dp(2), dp(1), dp(2), dp(3));
+                  bar.setThumb(thumb);
+                  bar.setThumbOffset(0);
+                  bar.setSplitTrack(false);
+                  bar.setBackground(null);
+                  bar.setPadding(dp(17), 0, dp(17), 0);
+              }
+
+              private LinearLayout newCard() {
+                  LinearLayout card = new LinearLayout(this);
+                  card.setOrientation(LinearLayout.VERTICAL);
+                  card.setPadding(dp(22), dp(22), dp(22), dp(22));
+                  card.setBackground(round(this.card, dp(28)));
+                  return card;
+              }
+
+              private LinearLayout.LayoutParams cardLp() {
+                  LinearLayout.LayoutParams lp = matchWrap();
+                  lp.bottomMargin = dp(12);
+                  return lp;
+              }
+
+              private TextView rowTitle(String text) {
+                  TextView view = new TextView(this);
+                  view.setText(text);
+                  view.setTextColor(textPrimary);
+                  view.setTextSize(16);
+                  view.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+                  return view;
+              }
+
+              private TextView rowBody(String text) {
+                  TextView view = new TextView(this);
+                  view.setText(text);
+                  view.setTextColor(textSecondary);
+                  view.setTextSize(14);
+                  view.setLineSpacing(0f, 1.15f);
+                  view.setPadding(0, dp(4), 0, 0);
+                  return view;
+              }
+
+              private TextView endpoint(String text, int gravity) {
+                  TextView view = new TextView(this);
+                  view.setText(text);
+                  view.setTextColor(textSecondary);
+                  view.setTextSize(13);
+                  view.setGravity(gravity | Gravity.CENTER_VERTICAL);
+                  return view;
+              }
+
+              private TextView stepper(String symbol, String description, int delta) {
+                  TextView button = new TextView(this);
+                  button.setText(symbol);
+                  button.setTextSize(26);
+                  button.setGravity(Gravity.CENTER);
+                  button.setTextColor(textPrimary);
+                  button.setIncludeFontPadding(false);
+                  button.setTypeface(Typeface.create("sans-serif-light", Typeface.NORMAL));
+                  button.setBackground(ripple(chipBg, dp(24)));
+                  button.setContentDescription(description);
+                  button.setClickable(true);
+                  button.setOnTouchListener(new StepTouch(delta));
+                  return button;
+              }
+
+              /** Tap for +/-1, hold to repeat; the value is saved shortly after the finger lifts. */
+              private final class StepTouch implements View.OnTouchListener {
+                  private final int delta;
+                  private final Runnable repeat = new Runnable() {
+                      @Override
+                      public void run() {
+                          setStrength(pendingValue + delta);
+                          handler.postDelayed(this, 70);
+                      }
+                  };
+
+                  StepTouch(int delta) {
+                      this.delta = delta;
+                  }
+
+                  @Override
+                  public boolean onTouch(View view, MotionEvent event) {
+                      switch (event.getActionMasked()) {
+                          case MotionEvent.ACTION_DOWN:
+                              setStrength(pendingValue + delta);
+                              handler.postDelayed(repeat, 420);
+                              break;
+                          case MotionEvent.ACTION_UP:
+                          case MotionEvent.ACTION_CANCEL:
+                              handler.removeCallbacks(repeat);
+                              schedulePersist();
+                              break;
+                          default:
+                              break;
+                      }
+                      return false; // let the view run its own pressed/ripple handling
+                  }
+              }
+
+              // ------------------------------------------------------------------ logic
+
+              private void refreshValue() {
+                  if (strengthBar == null) return;
+                  strengthBar.setEnabled(true);
+                  int current = clamp(Settings.System.getInt(getContentResolver(), KEY, DEFAULT_STRENGTH));
+                  pendingValue = current;
+                  strengthBar.setProgress(current);
+                  updateLabel(current);
+              }
+
+              private void setStrength(int requested) {
+                  int value = clamp(requested);
+                  if (value != pendingValue) {
+                      strengthBar.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK);
+                  }
+                  pendingValue = value;
+                  strengthBar.setProgress(value);
+                  updateLabel(value);
+              }
+
+              private void schedulePersist() {
+                  handler.removeCallbacks(persistRunnable);
+                  handler.postDelayed(persistRunnable, 450);
+              }
+
+              private void persist(int value) {
+                  final int requested = clamp(value);
+                  setStatus(STATUS_BUSY, "جارٍ حفظ مستوى البلور — وافق على طلب الروت إذا ظهر");
+                  saver.execute(() -> {
+                      boolean saved = RootSettings.writeAndVerify(requested);
+                      runOnUiThread(() -> {
+                          if (saved) {
+                              setStatus(STATUS_OK, "تم حفظ المستوى: " + requested + "٪؛ أعد فتح مركز التحكم");
+                          } else {
+                              setStatus(STATUS_ERROR, "فشل الحفظ؛ تحقق من موافقة مدير الروت على Mahmoud UI");
+                              Toast.makeText(MainActivity.this, "تعذر حفظ مستوى البلور بصلاحية الروت",
+                                      Toast.LENGTH_LONG).show();
+                          }
+                      });
+                  });
+              }
+
+              private void setStatus(int type, String text) {
+                  if (statusText == null || statusDot == null) return;
+                  int color;
+                  switch (type) {
+                      case STATUS_OK: color = green; break;
+                      case STATUS_ERROR: color = red; break;
+                      case STATUS_BUSY: color = accent; break;
+                      default: color = textSecondary; break;
+                  }
+                  GradientDrawable dot = new GradientDrawable();
+                  dot.setShape(GradientDrawable.OVAL);
+                  dot.setColor(color);
+                  statusDot.setBackground(dot);
+                  statusText.setText(text);
+              }
+
+              private void updateLabel(int value) {
+                  if (valueLabel != null) {
+                      String number = Integer.toString(value);
+                      SpannableString text = new SpannableString(number + "٪");
+                      text.setSpan(new RelativeSizeSpan(0.4f), number.length(), text.length(),
+                              Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                      valueLabel.setText(text);
+                  }
+                  for (int i = 0; i < chips.length; i++) {
+                      if (chips[i] == null) continue;
+                      boolean selected = chipValues[i] == value;
+                      if (selected == chipSelected[i] && chips[i].getBackground() != null) continue;
+                      chipSelected[i] = selected;
+                      chips[i].setBackground(ripple(selected ? accentSoft : chipBg, dp(28)));
+                      chips[i].setTextColor(selected ? accent : textPrimary);
+                      chips[i].setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+                  }
+              }
+
+              private int clamp(int value) {
+                  return Math.max(1, Math.min(MAX_STRENGTH, value));
+              }
+
+              // ---------------------------------------------------------------- helpers
+
+              private GradientDrawable round(int color, float radiusPx) {
+                  GradientDrawable drawable = new GradientDrawable();
+                  drawable.setColor(color);
+                  drawable.setCornerRadius(radiusPx);
+                  return drawable;
+              }
+
+              private Drawable ripple(int fill, float radiusPx) {
+                  ColorStateList rippleColor = ColorStateList.valueOf(dark ? 0x33FFFFFF : 0x1F000000);
+                  return new RippleDrawable(rippleColor, round(fill, radiusPx), round(Color.WHITE, radiusPx));
+              }
+
+              private LinearLayout.LayoutParams matchWrap() {
+                  return new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT,
+                          LinearLayout.LayoutParams.WRAP_CONTENT);
+              }
+
+              private int dp(float value) {
+                  return Math.round(value * getResources().getDisplayMetrics().density);
+              }
+          }
+          EOF_FILE
+          mkdir -p "$(dirname "app/src/main/java/dev/mahmuod/ui/RootSettings.java")"
+          cat > "app/src/main/java/dev/mahmuod/ui/RootSettings.java" << 'EOF_FILE'
+          package dev.mahmuod.ui;
+
+          import java.io.BufferedReader;
+          import java.io.InputStreamReader;
+          import java.util.concurrent.TimeUnit;
+
+          final class RootSettings {
+              private static final String KEY = "mahmuod_ui_blur_strength_v2";
+
+              private RootSettings() { }
+
+              static boolean writeAndVerify(int value) {
+                  int safeValue = Math.max(1, Math.min(100, value));
+                  String command = "settings put system " + KEY + " " + safeValue
+                          + " && settings get system " + KEY;
+                  Process process = null;
+                  try {
+                      process = new ProcessBuilder("su", "-c", command)
+                              .redirectErrorStream(true)
+                              .start();
+                      boolean finished = process.waitFor(60, TimeUnit.SECONDS);
+                      if (!finished) {
+                          process.destroyForcibly();
+                          return false;
+                      }
+                      int exitCode = process.exitValue();
+                      String output;
+                      try (BufferedReader reader = new BufferedReader(
+                              new InputStreamReader(process.getInputStream()))) {
+                          StringBuilder text = new StringBuilder();
+                          String line;
+                          while ((line = reader.readLine()) != null) text.append(line.trim()).append('\n');
+                          output = text.toString().trim();
+                      }
+                      if (exitCode != 0 || output.isEmpty()) return false;
+                      String[] lines = output.split("\\R");
+                      return Integer.toString(safeValue).equals(lines[lines.length - 1].trim());
+                  } catch (Throwable error) {
+                      if (process != null) process.destroyForcibly();
+                      return false;
+                  }
+              }
+          }
+          EOF_FILE
+          mkdir -p "$(dirname "xposed-stub/build.gradle")"
+          cat > "xposed-stub/build.gradle" << 'EOF_FILE'
+          plugins {
+              id 'java-library'
+          }
+
+          java {
+              sourceCompatibility = JavaVersion.VERSION_1_8
+              targetCompatibility = JavaVersion.VERSION_1_8
+          }
+          EOF_FILE
+          mkdir -p "$(dirname "xposed-stub/src/main/java/de/robv/android/xposed/IXposedHookLoadPackage.java")"
+          cat > "xposed-stub/src/main/java/de/robv/android/xposed/IXposedHookLoadPackage.java" << 'EOF_FILE'
+          package de.robv.android.xposed;
+
+          import de.robv.android.xposed.callbacks.XC_LoadPackage;
+
+          /** Compile-time stub of the Xposed API. The real class is provided by LSPosed at runtime. */
+          public interface IXposedHookLoadPackage {
+              void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) throws Throwable;
+          }
+          EOF_FILE
+          mkdir -p "$(dirname "xposed-stub/src/main/java/de/robv/android/xposed/XC_MethodHook.java")"
+          cat > "xposed-stub/src/main/java/de/robv/android/xposed/XC_MethodHook.java" << 'EOF_FILE'
+          package de.robv.android.xposed;
+
+          /** Compile-time stub of the Xposed API. */
+          public abstract class XC_MethodHook {
+              public XC_MethodHook() { }
+
+              public XC_MethodHook(int priority) { }
+
+              protected void beforeHookedMethod(MethodHookParam param) throws Throwable { }
+
+              protected void afterHookedMethod(MethodHookParam param) throws Throwable { }
+
+              public static class MethodHookParam {
+                  public java.lang.reflect.Member method;
+                  public Object thisObject;
+                  public Object[] args;
+
+                  public Object getResult() { return null; }
+
+                  public void setResult(Object result) { }
+
+                  public Throwable getThrowable() { return null; }
+
+                  public void setThrowable(Throwable throwable) { }
+              }
+
+              public class Unhook {
+                  public void unhook() { }
+              }
+          }
+          EOF_FILE
+          mkdir -p "$(dirname "xposed-stub/src/main/java/de/robv/android/xposed/XposedBridge.java")"
+          cat > "xposed-stub/src/main/java/de/robv/android/xposed/XposedBridge.java" << 'EOF_FILE'
+          package de.robv.android.xposed;
+
+          /** Compile-time stub of the Xposed API. */
+          public final class XposedBridge {
+              private XposedBridge() { }
+
+              public static void log(String text) { }
+
+              public static void log(Throwable t) { }
+          }
+          EOF_FILE
+          mkdir -p "$(dirname "xposed-stub/src/main/java/de/robv/android/xposed/XposedHelpers.java")"
+          cat > "xposed-stub/src/main/java/de/robv/android/xposed/XposedHelpers.java" << 'EOF_FILE'
+          package de.robv.android.xposed;
+
+          /** Compile-time stub of the Xposed API. */
+          public final class XposedHelpers {
+              private XposedHelpers() { }
+
+              public static Class<?> findClass(String className, ClassLoader classLoader) {
+                  throw new UnsupportedOperationException("stub");
+              }
+
+              public static XC_MethodHook.Unhook findAndHookMethod(Class<?> clazz, String methodName,
+                                                                   Object... parameterTypesAndCallback) {
+                  throw new UnsupportedOperationException("stub");
+              }
+
+              public static float getFloatField(Object obj, String fieldName) {
+                  throw new UnsupportedOperationException("stub");
+              }
+
+              public static void setFloatField(Object obj, String fieldName, float value) {
+                  throw new UnsupportedOperationException("stub");
+              }
+
+              public static Object callStaticMethod(Class<?> clazz, String methodName, Object... args) {
+                  throw new UnsupportedOperationException("stub");
+              }
+          }
+          EOF_FILE
+          mkdir -p "$(dirname "xposed-stub/src/main/java/de/robv/android/xposed/callbacks/XC_LoadPackage.java")"
+          cat > "xposed-stub/src/main/java/de/robv/android/xposed/callbacks/XC_LoadPackage.java" << 'EOF_FILE'
+          package de.robv.android.xposed.callbacks;
+
+          /** Compile-time stub of the Xposed API. */
+          public abstract class XC_LoadPackage {
+              public static final class LoadPackageParam {
+                  public String packageName;
+                  public String processName;
+                  public ClassLoader classLoader;
+                  public boolean isFirstApplication;
+              }
+          }
+          EOF_FILE
+          mkdir -p app/src/main/res/drawable
+          base64 -d > app/src/main/res/drawable/mahmoud_ui_icon.png << 'EOF_FILE'
+          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
+          Ra6gSwAAAABJRU5ErkJggg==
+          EOF_FILE
+          echo "PROJECT_DIR=$GITHUB_WORKSPACE/$P" >> "$GITHUB_ENV"
+          find . -type f | sort
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Android SDK packages
+        run: |
+          set +o pipefail
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Set up Gradle 8.10.2
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+
+      - name: Build Debug APK
+        run: |
+          cd "$PROJECT_DIR"
+          gradle assembleDebug --no-daemon --console=plain > build.log 2>&1 || {
+            echo "=== ERRORS ==="
+            grep -n -E "error:|What went wrong|Execution failed|Caused by|FAILURE|not found" -A6 build.log | head -80
+            exit 1
+          }
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: generated_project/build.log
+          if-no-files-found: ignore
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Mahmoud-UI-apk
+          path: generated_project/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
